@@ -3,15 +3,42 @@
 # Copyright (c) 2015, thumbor-community
 # Use of this source code is governed by the MIT license that can be
 # found in the LICENSE file.
+import asyncio
+import functools
+import contextlib
+import io
 
-import aiobotocore
+import aiobotocore.session
 from botocore.client import Config
+from thumbor.context import ContextImporter
 from thumbor.utils import logger
 from thumbor.engines import BaseEngine
 
 
+global_context_stack = contextlib.AsyncExitStack()
+
+
+async def get_aio_s3(session, **kwargs):
+    return await global_context_stack.enter_async_context(
+        session.create_client("s3", **kwargs),
+    )
+
+
+def _done_callback(fut, task):
+    if task.cancelled():
+        fut.cancel()
+        return
+
+    exc = task.exception()
+    if exc is not None:
+        fut.set_exception(exc)
+        return
+
+    fut.set_result(task.result())
+
+
 class Bucket(object):
-    _client = None
+    _client_future = None
     _instances = {}
 
     @staticmethod
@@ -36,29 +63,45 @@ class Bucket(object):
         """
         self._bucket = bucket
 
-        config = None
+        self.config = None
         if max_retry is not None:
-            config = Config(
-                retries=dict(
-                    max_attempts=max_retry
-                )
-            )
+            self.config = Config(retries=dict(max_attempts=max_retry))
 
-        if self._client is None:
-            self._client = aiobotocore.get_session().create_client(
-                's3',
-                region_name=region,
-                endpoint_url=endpoint,
-                config=config
+        self.region_name = region
+        self.endpoint_url = endpoint
+        self.session = aiobotocore.session.get_session()
+
+    async def get_client(self):
+        tasks = set()
+        if self._client_future is not None:
+            if self._client_future.done():
+                return self._client_future.result()
+            else:
+                return await asyncio.shield(self._client_future)
+        loop = asyncio.get_event_loop()
+        self._client_future = loop.create_future()
+        task = loop.create_task(
+            get_aio_s3(
+                self.session,
+                region_name=self.region_name,
+                endpoint_url=self.endpoint_url,
+                config=self.config,
             )
+        )
+        task.add_done_callback(functools.partial(_done_callback, self._client_future))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+        return await asyncio.shield(self._client_future)
 
     async def exists(self, path):
         """
         Checks if an object exists at a given path
         :param string path: Path or 'key' to retrieve AWS object
         """
+        s3_client = await self.get_client()
         try:
-            await self._client.head_object(
+            await s3_client.head_object(
                 Bucket=self._bucket,
                 Key=self._clean_key(path),
             )
@@ -71,8 +114,8 @@ class Bucket(object):
         Returns object at given path
         :param string path: Path or 'key' to retrieve AWS object
         """
-
-        return await self._client.get_object(
+        s3_client = await self.get_client()
+        return await s3_client.get_object(
             Bucket=self._bucket,
             Key=self._clean_key(path),
         )
@@ -84,8 +127,8 @@ class Bucket(object):
         :param string method: Method for requested URL
         :param int expiry: URL validity time
         """
-
-        url = await self._client.generate_presigned_url(
+        s3_client = await self.get_client()
+        url = await s3_client.generate_presigned_url(
             ClientMethod='get_object',
             Params={
                 'Bucket': self._bucket,
@@ -123,14 +166,16 @@ class Bucket(object):
         if metadata is not None:
             args['Metadata'] = metadata
 
-        return await self._client.put_object(**args)
+        s3_client = await self.get_client()
+        return await s3_client.put_object(**args)
 
     async def delete(self, path):
         """
         Deletes key at given path
         :param string path: Path or 'key' to delete
         """
-        return await self._client.delete_object(
+        s3_client = await self.get_client()
+        return await s3_client.delete_object(
             Bucket=self._bucket,
             Key=self._clean_key(path),
         )
@@ -147,3 +192,18 @@ class Bucket(object):
 
         logger.debug('Cleansed key: {key!r}'.format(key=key))
         return key
+
+
+orig_cleanup = ContextImporter.cleanup
+
+
+def cleanup(self):
+    global global_context_stack
+
+    orig_cleanup(self)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(global_context_stack.aclose())
+    global_context_stack = contextlib.AsyncExitStack()
+
+
+ContextImporter.cleanup = cleanup
